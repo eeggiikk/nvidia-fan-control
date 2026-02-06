@@ -1,0 +1,16 @@
+[Unit]
+Description=NVIDIA Fan Control - GPU fan speed manager
+After=network.target nvidia-persistenced.service
+
+[Service]
+Type=simple
+ExecStartPre=/bin/sleep 60
+ExecStart=/usr/local/bin/nvidia_fan_control
+WorkingDirectory=/etc/nvidia-fan-control
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
