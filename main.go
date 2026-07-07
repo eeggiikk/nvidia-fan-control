@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,8 +19,9 @@ const (
 
 type Config struct {
 	TimeToUpdate      int                `json:"time_to_update"`
-	TemperatureRanges []TemperatureRange `json:"temperature_ranges"`
 	CriticalTemp      int                `json:"critical_temp,omitempty"`
+	TemperatureRanges []TemperatureRange `json:"temperature_ranges"`
+
 }
 
 type TemperatureRange struct {
@@ -44,44 +46,42 @@ func getFanSpeedForTemperature(temp, prevSpeed int, ranges []TemperatureRange) i
 		return prevSpeed
 	}
 
-	currentRangeIdx := -1
-	for i, r := range ranges {
-		if prevSpeed == r.FanSpeed {
-			if temp > r.MinTemperature {
-				currentRangeIdx = i
-			} else if currentRangeIdx == -1 {
-				currentRangeIdx = i
-			}
-		}
-	}
-
+	// 1. Находим целевой диапазон для текущей температуры
 	targetRangeIdx := -1
 	for i, r := range ranges {
-		if temp > r.MinTemperature && temp <= r.MaxTemperature {
+		// Используем >= для нижней границы, чтобы корректно обрабатывать 0°C и стыки
+		if temp >= r.MinTemperature && (temp < r.MaxTemperature || i == len(ranges)-1) {
 			targetRangeIdx = i
 			break
 		}
 	}
 
 	if targetRangeIdx == -1 {
-		return prevSpeed
+		return prevSpeed // Температура вне заданных лимитов
 	}
 
-	if currentRangeIdx == -1 {
+	// 2. Находим текущий диапазон, в котором мы находимся (по предыдущей скорости)
+	currentRangeIdx := -1
+	for i, r := range ranges {
+		if prevSpeed == r.FanSpeed {
+			currentRangeIdx = i
+			break
+		}
+	}
+
+	if currentRangeIdx == -1 || currentRangeIdx == targetRangeIdx {
 		return ranges[targetRangeIdx].FanSpeed
-	}
-
-	if currentRangeIdx == targetRangeIdx {
-		return ranges[currentRangeIdx].FanSpeed
 	}
 
 	currentRange := ranges[currentRangeIdx]
 
+	// 3. Логика переключения с учетом гистерезиса
 	if targetRangeIdx > currentRangeIdx {
-		if temp > currentRange.MaxTemperature+currentRange.Hysteresis {
-			return ranges[targetRangeIdx].FanSpeed
-		}
+		// НАГРЕВ: Переключаемся сразу, как только попали в новый диапазон
+		// (Гистерезис при нагреве обычно не нужен, чтобы не перегревать карту)
+		return ranges[targetRangeIdx].FanSpeed
 	} else {
+		// ОХЛАЖДЕНИЕ: Применяем гистерезис, чтобы избежать "дребезга" вентиляторов
 		if temp <= currentRange.MinTemperature-currentRange.Hysteresis {
 			return ranges[targetRangeIdx].FanSpeed
 		}
@@ -90,15 +90,118 @@ func getFanSpeedForTemperature(temp, prevSpeed int, ranges []TemperatureRange) i
 	return currentRange.FanSpeed
 }
 
-func setupLogging(logFilePath string) (*os.File, error) {
-	logFile, err := os.OpenFile(logFilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open log file %s: %w", logFilePath, err)
+// RotatingFileWriter реализует io.Writer и автоматически ротирует логи
+type RotatingFileWriter struct {
+	mu          sync.Mutex
+	filename    string
+	maxSize     int64 // Максимальный размер файла в байтах
+	maxBackups  int   // Сколько старых файлов хранить
+	file        *os.File
+	currentSize int64
+}
+
+// NewRotatingFileWriter создает и открывает writer с настройками ротации
+func NewRotatingFileWriter(filename string, maxSizeMB int, maxBackups int) (*RotatingFileWriter, error) {
+	w := &RotatingFileWriter{
+		filename:   filename,
+		maxSize:    int64(maxSizeMB) * 1024 * 1024, // Переводим МБ в байты
+		maxBackups: maxBackups,
 	}
-	log.SetOutput(logFile)
+
+	// Открываем файл при старте
+	f, err := os.OpenFile(w.filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	w.file = f
+	w.currentSize = info.Size()
+
+	return w, nil
+}
+
+// Write проверяет размер перед записью и вызывает ротацию при необходимости
+func (w *RotatingFileWriter) Write(p []byte) (n int, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	if w.file == nil {
+		return 0, fmt.Errorf("log file is closed")
+	}
+
+	// Если добавление новых данных превысит лимит — ротируем
+	if w.currentSize+int64(len(p)) > w.maxSize {
+		if err := w.rotate(); err != nil {
+			return 0, fmt.Errorf("failed to rotate log: %w", err)
+		}
+	}
+
+	n, err = w.file.Write(p)
+	w.currentSize += int64(n)
+	return n, err
+}
+
+// Close корректно закрывает файловый дескриптор
+func (w *RotatingFileWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file != nil {
+		err := w.file.Close()
+		w.file = nil
+		return err
+	}
+	return nil
+}
+
+// rotate сдвигает старые бэкапы и создает новый файл
+func (w *RotatingFileWriter) rotate() error {
+	// 1. Закрываем текущий файл
+	if w.file != nil {
+		w.file.Close()
+		w.file = nil
+	}
+
+	// 2. Сдвигаем старые бэкапы (например: .4 -> .5, .3 -> .4, .2 -> .3, .1 -> .2)
+	for i := w.maxBackups - 1; i > 0; i-- {
+		src := fmt.Sprintf("%s.%d", w.filename, i)
+		dst := fmt.Sprintf("%s.%d", w.filename, i+1)
+		os.Rename(src, dst) // Игнорируем ошибки, если файла не существует
+	}
+
+	// 3. Переименовываем текущий заполненный файл в бэкап .1
+	if w.maxBackups > 0 {
+		os.Rename(w.filename, fmt.Sprintf("%s.%d", w.filename, 1))
+	} else {
+		os.Remove(w.filename) // Если бэкапы не нужны, просто удаляем
+	}
+
+	// 4. Открываем новый пустой файл для записи
+	f, err := os.OpenFile(w.filename, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	w.file = f
+	w.currentSize = 0
+	return nil
+}
+
+func setupLogging(logFilePath string) (*RotatingFileWriter, error) {
+	// Настройки: Максимум 1 МБ на файл, хранить 1 старую копию
+	writer, err := NewRotatingFileWriter(logFilePath, 1, 1)
+	if err != nil {
+		return nil, fmt.Errorf("failed to init rotating logger: %w", err)
+	}
+
+	// Передаем наш Writer в стандартный пакет log
+	log.SetOutput(writer)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	log.Println("INFO: Logging setup complete.")
-	return logFile, nil
+	log.Println("INFO: Logging setup complete with custom rotation.")
+
+	return writer, nil
 }
 
 func loadConfiguration(configPath string) (Config, error) {
@@ -193,13 +296,12 @@ func initializeDevices() (count int, fanCounts []int, prevFanSpeeds [][]int, err
 			continue
 		}
 		fanCounts[i] = numFansInt
-
 		if fanCounts[i] <= 0 {
 			log.Printf("INFO: Device %d reports %d controllable fans. Skipping fan initialization.", i, fanCounts[i])
 			continue
 		}
 
-		log.Printf("INFO: Device %d has %d controllable fan(s). Initializing state.", i, fanCounts[i])
+		log.Printf("INFO: Device %d has %d controllable fan(s). Initializing state and setting MANUAL policy.", i, fanCounts[i])
 		prevFanSpeeds[i] = make([]int, fanCounts[i])
 
 		var initialTemp int
@@ -211,6 +313,27 @@ func initializeDevices() (count int, fanCounts []int, prevFanSpeeds [][]int, err
 			initialTemp = -1
 		}
 
+		// ✅ НОВОЕ: Устанавливаем MANUAL политику ОДИН РАЗ при инициализации
+		allFansConfigurable := true
+		for fanIdx := 0; fanIdx < fanCounts[i]; fanIdx++ {
+			ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_MANUAL)
+			if ret != nvml.SUCCESS {
+				log.Printf("ERROR: Unable to set MANUAL fan control policy for GPU %d Fan %d: %v. Device will not be managed.",
+					i, fanIdx, nvml.ErrorString(ret))
+				allFansConfigurable = false
+				break
+			}
+			log.Printf("INFO: GPU %d Fan %d set to MANUAL control policy (once at init).", i, fanIdx)
+		}
+
+		// Если политика MANUAL не установилась — пропускаем устройство
+		if !allFansConfigurable {
+			fanCounts[i] = 0
+			prevFanSpeeds[i] = nil
+			continue
+		}
+
+		// Читаем текущие скорости вентиляторов (после установки MANUAL политики)
 		for fanIdx := 0; fanIdx < fanCounts[i]; fanIdx++ {
 			speed, ret := nvml.DeviceGetFanSpeed_v2(device, fanIdx)
 			if ret == nvml.SUCCESS {
@@ -226,6 +349,7 @@ func initializeDevices() (count int, fanCounts []int, prevFanSpeeds [][]int, err
 				}
 			}
 		}
+
 		log.Printf("INFO: Initial state for device %d: Temp=%d°C, Fan Speeds=%v%%", i, initialTemp, prevFanSpeeds[i])
 		initializedDevices++
 	}
@@ -252,7 +376,7 @@ func resetFansToAuto(count int, fanCounts []int) {
 		}
 
 		for fanIdx := 0; fanIdx < fanCounts[i]; fanIdx++ {
-			ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
+			ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_TEMPERATURE_CONTINUOUS_SW)
 			if ret != nvml.SUCCESS {
 				log.Printf("ERROR: Unable to reset fan %d on GPU %d to auto: %v", fanIdx, i, nvml.ErrorString(ret))
 			} else {
@@ -265,15 +389,9 @@ func resetFansToAuto(count int, fanCounts []int) {
 
 func handleCriticalTemperature(device nvml.Device, deviceIdx int, fanCount int, temp int, prevFanSpeeds []int) {
 	log.Printf("CRITICAL: GPU %d temperature %d°C exceeds critical threshold! Activating emergency cooling.", deviceIdx, temp)
-
 	for fanIdx := 0; fanIdx < fanCount; fanIdx++ {
-		ret := nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_MANUAL)
-		if ret != nvml.SUCCESS && ret != nvml.ERROR_NOT_SUPPORTED {
-			log.Printf("ERROR: Unable to set manual fan control policy for GPU %d Fan %d: %v", deviceIdx, fanIdx, nvml.ErrorString(ret))
-			continue
-		}
-
-		ret = nvml.DeviceSetFanSpeed_v2(device, fanIdx, CriticalFanSpeed)
+		// ✅ Политика MANUAL уже установлена при инициализации — сразу выкручиваем на 100%
+		ret := nvml.DeviceSetFanSpeed_v2(device, fanIdx, CriticalFanSpeed)
 		if ret != nvml.SUCCESS {
 			log.Printf("ERROR: Unable to set emergency fan speed for GPU %d Fan %d: %v", deviceIdx, fanIdx, nvml.ErrorString(ret))
 		} else {
@@ -281,7 +399,6 @@ func handleCriticalTemperature(device nvml.Device, deviceIdx int, fanCount int, 
 			prevFanSpeeds[fanIdx] = CriticalFanSpeed
 		}
 	}
-
 	killGPUProcesses(device, deviceIdx)
 }
 
@@ -326,16 +443,14 @@ func killGPUProcesses(device nvml.Device, deviceIdx int) {
 
 	for _, pid := range pidsToKill {
 		err := syscall.Kill(int(pid), syscall.SIGTERM)
-		if err != nil {
-			log.Printf("ERROR: Failed to send SIGTERM to PID %d: %v", pid, err)
-			err = syscall.Kill(int(pid), syscall.SIGKILL)
-			if err != nil {
-				log.Printf("ERROR: Failed to send SIGKILL to PID %d: %v", pid, err)
-			} else {
-				log.Printf("CRITICAL: Sent SIGKILL to PID %d", pid)
-			}
-		} else {
-			log.Printf("CRITICAL: Sent SIGTERM to PID %d", pid)
+		if err == nil {
+		time.Sleep(2 * time.Second) // Даем время на graceful shutdown
+		// Проверяем, жив ли процесс (сигнал 0)
+		if syscall.Kill(int(pid), 0) == nil {
+			syscall.Kill(int(pid), syscall.SIGKILL) // Убиваем принудительно
+		}
+		} else if err != syscall.ESRCH {
+		log.Printf("ERROR: Failed to send SIGTERM to PID %d: %v", pid, err)
 		}
 	}
 }
@@ -357,8 +472,8 @@ func processDevices(config Config, count int, fanCounts []int, prevFanSpeeds [][
 			log.Printf("ERROR: Unable to get temperature for device %d: %v. Skipping cycle for this device.", i, nvml.ErrorString(ret))
 			continue
 		}
-		tempInt := int(temp)
 
+		tempInt := int(temp)
 		if tempInt >= config.CriticalTemp {
 			handleCriticalTemperature(device, i, fanCounts[i], tempInt, prevFanSpeeds[i])
 			continue
@@ -366,24 +481,15 @@ func processDevices(config Config, count int, fanCounts []int, prevFanSpeeds [][
 
 		for fanIdx := 0; fanIdx < fanCounts[i]; fanIdx++ {
 			newFanSpeed := getFanSpeedForTemperature(tempInt, prevFanSpeeds[i][fanIdx], config.TemperatureRanges)
-
 			if forceUpdate || newFanSpeed != prevFanSpeeds[i][fanIdx] {
-				ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_MANUAL)
-				if ret != nvml.SUCCESS && ret != nvml.ERROR_NOT_SUPPORTED {
-					log.Printf("ERROR: Unable to set manual fan control policy for GPU %d Fan %d: %v", i, fanIdx, nvml.ErrorString(ret))
-					continue
-				} else if ret == nvml.ERROR_NOT_SUPPORTED {
-					log.Printf("WARN: Manual fan control policy not supported for GPU %d Fan %d. Cannot set speed.", i, fanIdx)
-					continue
-				}
-
+				// ✅ ПОЛИТИКА MANUAL уже установлена при инициализации — сразу меняем скорость
 				ret = nvml.DeviceSetFanSpeed_v2(device, fanIdx, newFanSpeed)
 				if ret != nvml.SUCCESS {
 					log.Printf("ERROR: Unable to set fan speed for GPU %d Fan %d to %d%%: %v", i, fanIdx, newFanSpeed, nvml.ErrorString(ret))
 					continue
 				}
-
-				log.Printf("INFO: Updated GPU %d Fan %d: Temp=%d°C, PrevSpeed=%d%%, NewSpeed=%d%%", i, fanIdx, tempInt, prevFanSpeeds[i][fanIdx], newFanSpeed)
+				log.Printf("INFO: Updated GPU %d Fan %d: Temp=%d°C, PrevSpeed=%d%%, NewSpeed=%d%%",
+					i, fanIdx, tempInt, prevFanSpeeds[i][fanIdx], newFanSpeed)
 				prevFanSpeeds[i][fanIdx] = newFanSpeed
 			}
 		}
