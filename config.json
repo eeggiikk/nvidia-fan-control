@@ -1,6 +1,5 @@
 {
   "time_to_update": 5,
-  #"max_log_size_mb": 2,
   "critical_temp": 100,
   "temperature_ranges": [
     { "min_temperature": 0, "max_temperature": 45, "fan_speed": 30, "hysteresis": 3 },
