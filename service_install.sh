@@ -3,16 +3,22 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-if [ ! -f "$SCRIPT_DIR/nvidia_fan_control" ]; then
-    echo "==> Building nvidia_fan_control binary..."
-    cd "$SCRIPT_DIR"
-    go build -o nvidia_fan_control .
-fi
-
 if [ "$(id -u)" -ne 0 ]; then
     echo "==> Re-running as root..."
     exec sudo "$0" "$@"
 fi
+
+if ! command -v go &> /dev/null; then
+    echo "ERROR: Go compiler is not installed. Please install golang first."
+    exit 1
+fi
+
+echo "==> Updating dependencies with go mod tidy..."
+go mod tidy
+go mod download
+
+echo "==> Building nvidia_fan_control binary..."
+go build -o nvidia_fan_control .
 
 echo "==> Installing binary to /usr/local/bin/nvidia_fan_control..."
 cp "$SCRIPT_DIR/nvidia_fan_control" /usr/local/bin/nvidia_fan_control
@@ -28,6 +34,11 @@ if [ ! -f /etc/nvidia-fan-control/config.json ]; then
     echo "    config.json installed."
 else
     echo "    config.json already exists, skipping to avoid overwriting."
+fi
+
+if [ ! -f "$SCRIPT_DIR/nvidia-fan-control.service" ]; then
+    echo "ERROR: nvidia-fan-control.service file not found in $SCRIPT_DIR"
+    exit 1
 fi
 
 echo "==> Installing systemd service..."
@@ -46,4 +57,4 @@ echo "==> Service status:"
 systemctl status nvidia-fan-control --no-pager
 
 echo ""
-echo "Done. View logs with: journalctl -u nvidia-fan-control -f"
+echo "Done. View logs with: sudo tail -F /var/log/nvidia_fan_control.log"
