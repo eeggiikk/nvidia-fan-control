@@ -376,7 +376,7 @@ func resetFansToAuto(count int, fanCounts []int) {
 		}
 
 		for fanIdx := 0; fanIdx < fanCounts[i]; fanIdx++ {
-			ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_TEMPERATURE_CONTINUOUS_SW)
+			ret = nvml.DeviceSetFanControlPolicy(device, fanIdx, nvml.FAN_POLICY_TEMPERATURE_CONTINOUS_SW)
 			if ret != nvml.SUCCESS {
 				log.Printf("ERROR: Unable to reset fan %d on GPU %d to auto: %v", fanIdx, i, nvml.ErrorString(ret))
 			} else {
